@@ -17,6 +17,7 @@
 package legacypool
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	crand "crypto/rand"
 	"errors"
@@ -617,6 +618,145 @@ func TestChainFork(t *testing.T) {
 	resetState()
 	if _, err := pool.add(tx); err != nil {
 		t.Error("didn't expect error", err)
+	}
+}
+
+// TestForkRevalidation checks that transactions which were valid under the rules
+// of the old head, but are rejected by the rules of the new one, are discarded
+// when the fork activates instead of lingering in the pool as pending.
+func TestForkRevalidation(t *testing.T) {
+	t.Parallel()
+
+	const (
+		blockGasLimit = 30_000_000
+		forkTime      = 100
+	)
+	// One config scheduling Amsterdam at the fork time, with Osaka live from
+	// genesis, and one scheduling Osaka, with Prague live from genesis.
+	activation := uint64(forkTime)
+
+	amsterdam := *params.MergedTestChainConfig
+	amsterdam.AmsterdamTime = &activation
+
+	osaka := *params.MergedTestChainConfig
+	osaka.OsakaTime = &activation
+
+	newTx := func(key *ecdsa.PrivateKey, gas uint64, data []byte, list types.AccessList) *types.Transaction {
+		tx, _ := types.SignNewTx(key, types.LatestSignerForChainID(params.TestChainConfig.ChainID), &types.DynamicFeeTx{
+			ChainID:    params.TestChainConfig.ChainID,
+			Nonce:      0,
+			GasTipCap:  big.NewInt(1),
+			GasFeeCap:  big.NewInt(1),
+			Gas:        gas,
+			To:         &common.Address{0x01},
+			Value:      big.NewInt(0),
+			Data:       data,
+			AccessList: list,
+		})
+		return tx
+	}
+	accessList := types.AccessList{{Address: common.Address{0x02}, StorageKeys: make([]common.Hash, 8)}}
+	calldata := bytes.Repeat([]byte{0x01}, 1000)
+
+	for _, tt := range []struct {
+		name    string
+		config  *params.ChainConfig
+		invalid func(key *ecdsa.PrivateKey) *types.Transaction // valid before the fork, rejected after
+		valid   func(key *ecdsa.PrivateKey) *types.Transaction // valid on both sides of the fork
+	}{
+		{
+			// EIP-7976 raises the calldata floor from 40 to 64 gas per byte and
+			// anchors it to the EIP-2780 base cost: 61,000 before, 79,000 after.
+			name:    "calldata floor",
+			config:  &amsterdam,
+			invalid: func(key *ecdsa.PrivateKey) *types.Transaction { return newTx(key, 61000, calldata, nil) },
+			valid:   func(key *ecdsa.PrivateKey) *types.Transaction { return newTx(key, 79000, calldata, nil) },
+		},
+		{
+			// EIP-7981 reprices the access list entries and charges them as
+			// calldata tokens on top: 38,600 before, 51,564 after.
+			name:    "access list cost",
+			config:  &amsterdam,
+			invalid: func(key *ecdsa.PrivateKey) *types.Transaction { return newTx(key, 38600, nil, accessList) },
+			valid:   func(key *ecdsa.PrivateKey) *types.Transaction { return newTx(key, 51564, nil, accessList) },
+		},
+		{
+			// EIP-7825 caps the gas limit of a single transaction.
+			name:    "transaction gas cap",
+			config:  &osaka,
+			invalid: func(key *ecdsa.PrivateKey) *types.Transaction { return newTx(key, params.MaxTxGas+1, nil, nil) },
+			valid:   func(key *ecdsa.PrivateKey) *types.Transaction { return newTx(key, params.MaxTxGas, nil, nil) },
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+			blockchain := newTestBlockChain(tt.config, blockGasLimit, statedb, new(event.Feed))
+
+			pool := New(testTxPoolConfig, blockchain)
+			if err := pool.Init(testTxPoolConfig.PriceLimit, blockchain.CurrentBlock(), newReserver()); err != nil {
+				t.Fatalf("failed to initialize pool: %v", err)
+			}
+			defer pool.Close()
+			<-pool.initDoneCh
+
+			dropKey, _ := crypto.GenerateKey()
+			keepKey, _ := crypto.GenerateKey()
+			for _, key := range []*ecdsa.PrivateKey{dropKey, keepKey} {
+				testAddBalance(pool, crypto.PubkeyToAddress(key.PublicKey), big.NewInt(1e18))
+			}
+			var (
+				dropped = tt.invalid(dropKey)
+				kept    = tt.valid(keepKey)
+			)
+			if errs := pool.addRemotesSync([]*types.Transaction{dropped, kept}); errs[0] != nil || errs[1] != nil {
+				t.Fatalf("failed to add transactions before the fork: %v, %v", errs[0], errs[1])
+			}
+			if pending, queued := pool.Stats(); pending != 2 || queued != 0 {
+				t.Fatalf("pool stats mismatch before the fork: pending %d, queued %d, want 2, 0", pending, queued)
+			}
+			// Move the head across the fork boundary.
+			oldHead := &types.Header{
+				Number:     new(big.Int),
+				Difficulty: new(big.Int),
+				GasLimit:   blockGasLimit,
+				BaseFee:    new(big.Int),
+			}
+			newHead := &types.Header{
+				ParentHash: oldHead.Hash(),
+				Number:     big.NewInt(1),
+				Difficulty: new(big.Int),
+				GasLimit:   blockGasLimit,
+				BaseFee:    new(big.Int),
+				Time:       forkTime,
+			}
+			<-pool.requestReset(oldHead, newHead)
+
+			if pool.Get(dropped.Hash()) != nil {
+				t.Errorf("transaction invalidated by the fork still pooled")
+			}
+			if pool.Get(kept.Hash()) == nil {
+				t.Errorf("transaction still valid after the fork was dropped")
+			}
+			if pending, queued := pool.Stats(); pending != 1 || queued != 0 {
+				t.Errorf("pool stats mismatch after the fork: pending %d, queued %d, want 1, 0", pending, queued)
+			}
+			if nonce := pool.Nonce(crypto.PubkeyToAddress(dropKey.PublicKey)); nonce != 0 {
+				t.Errorf("pending nonce still counts the dropped transaction: have %d, want 0", nonce)
+			}
+			// The sender can resubmit the transaction with the gas the new rules
+			// require, without having to bump the fee of a replacement.
+			if err := pool.addRemoteSync(tt.valid(dropKey)); err != nil {
+				t.Fatalf("failed to add transaction after the fork: %v", err)
+			}
+			if pending, queued := pool.Stats(); pending != 2 || queued != 0 {
+				t.Errorf("pool stats mismatch after resubmission: pending %d, queued %d, want 2, 0", pending, queued)
+			}
+			if err := validatePoolInternals(pool); err != nil {
+				t.Fatalf("pool internals mismatch: %v", err)
+			}
+		})
 	}
 }
 

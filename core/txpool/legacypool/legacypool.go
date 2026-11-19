@@ -1215,14 +1215,22 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 	}
 	pool.mu.Lock()
 	if reset != nil {
-		if reset.newHead != nil && reset.oldHead != nil {
-			// Discard the transactions with the gas limit higher than the cap at the
-			// Osaka fork boundary.
-			if pool.chainconfig.IsOsaka(reset.newHead.Number, reset.newHead.Time) &&
-				!pool.chainconfig.IsOsaka(reset.oldHead.Number, reset.oldHead.Time) {
+		// Reset from the old head to the new, rescheduling any reorged transactions
+		pool.reset(reset.oldHead, reset.newHead)
+
+		// If the new head activates a fork, the pool may hold transactions which
+		// were valid under the old rules but aren't any more, e.g. ones above a
+		// new gas cap or below a raised intrinsic gas cost. Those can never be
+		// mined, so re-run the stateless checks against the new head and discard
+		// the failures.
+		if reset.oldHead != nil && reset.newHead != nil {
+			oldRules := pool.chainconfig.Rules(reset.oldHead.Number, reset.oldHead.Difficulty.Sign() == 0, reset.oldHead.Time)
+			newRules := pool.chainconfig.Rules(reset.newHead.Number, reset.newHead.Difficulty.Sign() == 0, reset.newHead.Time)
+			if oldRules != newRules {
 				var hashes []common.Hash
 				pool.all.Range(func(hash common.Hash, tx *types.Transaction) bool {
-					if tx.Gas() > params.MaxTxGas {
+					if err := pool.ValidateTxBasics(tx); err != nil {
+						log.Debug("Discarding transaction invalidated by fork", "hash", hash, "err", err)
 						hashes = append(hashes, hash)
 					}
 					return true
@@ -1232,9 +1240,6 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 				}
 			}
 		}
-		// Reset from the old head to the new, rescheduling any reorged transactions
-		pool.reset(reset.oldHead, reset.newHead)
-
 		// Nonces were reset, discard any events that became stale
 		for addr := range events {
 			events[addr].Forward(pool.pendingNonces.get(addr))
